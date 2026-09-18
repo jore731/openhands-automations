@@ -1,7 +1,7 @@
 enabled: true
 entrypoint: .venv/bin/python main.py
 keep_alive: null
-model: null
+model: github-copilot/gpt-5.6-luna
 name: SaDPe OpenHands issue processor
 preset_metadata:
   preset_type: prompt

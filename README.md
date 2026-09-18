@@ -39,7 +39,7 @@ docker exec <container> sh -lc \
   'npx -y opencode-ai@1.18.31 models github-copilot'
 ```
 
-The issue processor uses the OpenHands SDK's native `ACPAgentSettings` with
-`acp_server: opencode`; it does not call the OpenHands LLM directly. The
-automation's `model` value is the default OpenCode model identity, while
-`AUTOMATION_MODEL` can override it with another GitHub Copilot model ID.
+The issue-processing automations use OpenCode ACP agents; they do not call the
+OpenHands LLM directly. The `model` value is the default OpenCode model
+identity, while `AUTOMATION_MODEL` can override it with another GitHub Copilot
+model ID.

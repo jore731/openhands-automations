@@ -16,7 +16,6 @@ Both workspace types share the same interface:
   - clone_repos() - clone repositories with auto-fetched tokens
   - load_skills_from_agent_server() - load skills via agent server API
   - get_repos_context() - generate context string for cloned repos
-  - get_llm() - get LLM configuration
   - get_secrets() - get user secrets
   - get_mcp_config() - get MCP server configuration
 
@@ -30,13 +29,12 @@ The script:
   2. Opens the workspace context EARLY (ensures callback on any failure)
   3. Clones repos via workspace.clone_repos()
   4. Loads skills via workspace.load_skills_from_agent_server()
-  5. Gets LLM config via workspace.get_llm()
-  6. Gets secrets via workspace.get_secrets()
-  7. Gets MCP config via workspace.get_mcp_config()
-  8. Gets default agent with tools and condenser
-  9. Creates a RemoteConversation, sets a descriptive title, and injects secrets
-  10. Sends the user's prompt (with event context if available) and runs
-  11. On context manager exit, the workspace sends a completion callback
+  5. Gets secrets via workspace.get_secrets()
+  6. Gets MCP config via workspace.get_mcp_config()
+  7. Creates an OpenHands SDK ACPAgent configured for OpenCode
+  8. Creates a RemoteConversation, sets a descriptive title, and injects secrets
+  9. Sends the user's prompt (with event context if available) and runs
+  10. On context manager exit, the workspace sends a completion callback
 
 IMPORTANT: The workspace context is entered early so that ANY exception
 (skill loading, prompt parsing, etc.) triggers the __exit__ callback,
@@ -60,7 +58,7 @@ Common env vars:
   AUTOMATION_USER_ID         - owner user ID for observability attribution (optional)
   AUTOMATION_ORG_ID          - owner org ID for observability context (optional)
   AUTOMATION_EVENT_PAYLOAD   - JSON with trigger info and event payload (optional)
-  AUTOMATION_MODEL           - model profile name to load instead of default (optional)
+  AUTOMATION_MODEL           - OpenCode model ID (optional)
 
 Runtime-injected secrets (via conversation.update_secrets after Conversation creation):
   AUTOMATION_SESSION_URL     - direct URL to this conversation in the OpenHands UI
@@ -68,7 +66,6 @@ Runtime-injected secrets (via conversation.update_secrets after Conversation cre
 
 """
 
-import inspect
 import json
 import os
 import sys
@@ -188,24 +185,15 @@ def _phase_poster() -> None:
 
 
 # SDK imports (before workspace context so import errors are caught)
-from openhands.sdk import Conversation, RemoteConversation
+from openhands.sdk import ACPAgentSettings, Conversation, RemoteConversation
 from finish_tool_hook import finish_tool_required_hook_config
-from openhands.tools.preset import TaskOutcome
 
 try:
     from openhands.sdk.mcp.config import coerce_mcp_config as _coerce_mcp_config
 except ImportError:
     _coerce_mcp_config = None
 from openhands.sdk.workspace.remote.base import RemoteWorkspace
-from openhands.tools.preset.default import get_default_agent
 from openhands.workspace import OpenHandsCloudWorkspace
-
-
-def _conversation_supports_user_id() -> bool:
-    try:
-        return "user_id" in inspect.signature(Conversation.__new__).parameters
-    except (TypeError, ValueError):
-        return False
 
 
 def _normalize_mcp_config(raw_mcp_config):
@@ -397,23 +385,7 @@ More activity arrived on the same subject while this run was queued:
 
 {USER_PROMPT}"""
 
-    # Get LLM config via workspace/profile APIs
-    print("\n=== GET_LLM ===")
-    try:
-        llm = workspace.get_llm(profile_name=model_profile)
-    except FileNotFoundError:
-        if not model_profile:
-            raise
-        print(
-            f"  profile {model_profile!r} not found; "
-            "falling back to active/default profile"
-        )
-        llm = workspace.get_llm()
-    print(f"  profile: {model_profile or 'DEFAULT'}")
-    print(f"  model: {llm.model}")
-    print(f"  api_key present: {bool(llm.api_key)}")
-
-    # Get secrets via workspace
+    # OpenCode receives the allow-listed secrets through its child environment.
     print("\n=== GET_SECRETS ===")
     secrets = {}
     try:
@@ -423,43 +395,29 @@ More activity arrived on the same subject while this run was queued:
         # Not a hard failure — user may not have secrets configured
         print(f"  get_secrets() failed (ok if no secrets): {e}")
 
-    # Get MCP config via workspace
     print("\n=== GET_MCP_CONFIG ===")
     mcp_config = {}
     try:
         mcp_config = _normalize_mcp_config(workspace.get_mcp_config())
-        if mcp_config:
-            print(f"  servers: {list(mcp_config.keys())}")
-        else:
-            print("  no MCP servers configured")
+        print(f"  servers: {list(mcp_config.keys()) or '(none)'}")
     except Exception as e:
-        # Not a hard failure — user may not have MCP configured
-        print(f"  get_mcp_config() failed (ok if no MCP): {e}")
+        print(f"  get_mcp_config() failed (continuing without MCP): {e}")
 
-    # Get default agent with tools and condenser (CLI mode to disable browser)
-    print("\n=== AGENT ===")
+    print("\n=== OPENCODE ACP ===")
     report_phase("Configuring agent")
-    # Keep finish-tool schema wiring in sync with presets/plugin/sdk_main.py.
-    agent = get_default_agent(
-        llm=llm,
-        cli_mode=True,
-        finish_tool_response_schema=TaskOutcome,
+    model = model_profile or "github-copilot/gpt-5.6-luna"
+    settings = ACPAgentSettings(
+        acp_server="opencode",
+        acp_command=["npx", "-y", "opencode-ai@1.18.31", "acp"],
+        acp_model=model,
+        acp_session_mode="build",
+        mcp_config=mcp_config,
+        agent_context=agent_context,
     )
-
-    # Add MCP config and agent_context using model_copy if configured
-    agent_updates = {}
-    if mcp_config:
-        agent_updates["mcp_config"] = mcp_config
-    if agent_context:
-        agent_updates["agent_context"] = agent_context
-    if agent_updates:
-        agent = agent.model_copy(update=agent_updates)
-
-    print(f"  tools: {[t.name for t in agent.tools]}")
+    agent = settings.create_agent()
+    print(f"  model: {model}")
     print(f"  mcp_config: {'configured' if mcp_config else 'none'}")
     print(f"  skills: {len(loaded_skills) if loaded_skills else 0}")
-    condenser_name = type(agent.condenser).__name__ if agent.condenser else "none"
-    print(f"  condenser: {condenser_name}")
 
     # Create conversation
     print("\n=== CONVERSATION ===")
@@ -500,7 +458,7 @@ More activity arrived on the same subject while this run was queued:
         "delete_on_close": False,  # Keep conversation history after completion
         "tags": conversation_tags or None,
     }
-    if automation_user_id and _conversation_supports_user_id():
+    if automation_user_id:
         conversation_kwargs["user_id"] = automation_user_id
     # A `continue_conversation` run must use the derived id: RemoteConversation
     # attaches to that conversation if it exists, and creates it if it does not.
