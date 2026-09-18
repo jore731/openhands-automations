@@ -16,7 +16,6 @@ Both workspace types share the same interface:
   - clone_repos() - clone repositories with auto-fetched tokens
   - load_skills_from_agent_server() - load skills via agent server API
   - get_repos_context() - generate context string for cloned repos
-  - get_llm() - get LLM configuration
   - get_secrets() - get user secrets
   - get_mcp_config() - get MCP server configuration
 
@@ -30,13 +29,12 @@ The script:
   2. Opens the workspace context EARLY (ensures callback on any failure)
   3. Clones repos via workspace.clone_repos()
   4. Loads skills via workspace.load_skills_from_agent_server()
-  5. Gets LLM config via workspace.get_llm()
-  6. Gets secrets via workspace.get_secrets()
-  7. Gets MCP config via workspace.get_mcp_config()
-  8. Gets default agent with tools and condenser
-  9. Creates a RemoteConversation, sets a descriptive title, and injects secrets
-  10. Sends the user's prompt (with event context if available) and runs
-  11. On context manager exit, the workspace sends a completion callback
+  5. Gets secrets via workspace.get_secrets()
+  6. Gets MCP config via workspace.get_mcp_config()
+  7. Creates an OpenHands SDK ACPAgent configured for OpenCode
+  8. Creates a RemoteConversation and injects secrets
+  9. Sends the user's prompt (with event context if available) and runs
+  10. On context manager exit, the workspace sends a completion callback
 
 IMPORTANT: The workspace context is entered early so that ANY exception
 (skill loading, prompt parsing, etc.) triggers the __exit__ callback,
@@ -60,15 +58,14 @@ Common env vars:
   AUTOMATION_USER_ID         - owner user ID for observability attribution (optional)
   AUTOMATION_ORG_ID          - owner org ID for observability context (optional)
   AUTOMATION_EVENT_PAYLOAD   - JSON with trigger info and event payload (optional)
-  AUTOMATION_MODEL           - model profile name to load instead of default (optional)
+  AUTOMATION_MODEL            - OpenCode model ID (optional)
 
-Runtime-injected secrets (via conversation.update_secrets after Conversation creation):
+Runtime-injected secrets (via the Conversation secrets channel):
   AUTOMATION_SESSION_URL     - direct URL to this conversation in the OpenHands UI
                                (Cloud mode only; built from conversation.id)
 
 """
 
-import inspect
 import json
 import os
 import sys
@@ -188,24 +185,15 @@ def _phase_poster() -> None:
 
 
 # SDK imports (before workspace context so import errors are caught)
-from openhands.sdk import Conversation, RemoteConversation
+from openhands.sdk import ACPAgentSettings, Conversation, RemoteConversation
 from finish_tool_hook import finish_tool_required_hook_config
-from openhands.tools.preset import TaskOutcome
 
 try:
     from openhands.sdk.mcp.config import coerce_mcp_config as _coerce_mcp_config
 except ImportError:
     _coerce_mcp_config = None
 from openhands.sdk.workspace.remote.base import RemoteWorkspace
-from openhands.tools.preset.default import get_default_agent
 from openhands.workspace import OpenHandsCloudWorkspace
-
-
-def _conversation_supports_user_id() -> bool:
-    try:
-        return "user_id" in inspect.signature(Conversation.__new__).parameters
-    except (TypeError, ValueError):
-        return False
 
 
 def _normalize_mcp_config(raw_mcp_config):
@@ -397,23 +385,7 @@ More activity arrived on the same subject while this run was queued:
 
 {USER_PROMPT}"""
 
-    # Get LLM config via workspace/profile APIs
-    print("\n=== GET_LLM ===")
-    try:
-        llm = workspace.get_llm(profile_name=model_profile)
-    except FileNotFoundError:
-        if not model_profile:
-            raise
-        print(
-            f"  profile {model_profile!r} not found; "
-            "falling back to active/default profile"
-        )
-        llm = workspace.get_llm()
-    print(f"  profile: {model_profile or 'DEFAULT'}")
-    print(f"  model: {llm.model}")
-    print(f"  api_key present: {bool(llm.api_key)}")
-
-    # Get secrets via workspace
+    # OpenCode receives the allow-listed secrets through its child environment.
     print("\n=== GET_SECRETS ===")
     secrets = {}
     try:
@@ -422,155 +394,54 @@ More activity arrived on the same subject while this run was queued:
     except Exception as e:
         # Not a hard failure — user may not have secrets configured
         print(f"  get_secrets() failed (ok if no secrets): {e}")
-
-    # Get MCP config via workspace
     print("\n=== GET_MCP_CONFIG ===")
     mcp_config = {}
     try:
         mcp_config = _normalize_mcp_config(workspace.get_mcp_config())
-        if mcp_config:
-            print(f"  servers: {list(mcp_config.keys())}")
-        else:
-            print("  no MCP servers configured")
+        print(f"  servers: {list(mcp_config.keys()) or '(none)'}")
     except Exception as e:
-        # Not a hard failure — user may not have MCP configured
-        print(f"  get_mcp_config() failed (ok if no MCP): {e}")
+        print(f"  get_mcp_config() failed (continuing without MCP): {e}")
 
-    # Get default agent with tools and condenser (CLI mode to disable browser)
-    print("\n=== AGENT ===")
-    report_phase("Configuring agent")
-    # Keep finish-tool schema wiring in sync with presets/plugin/sdk_main.py.
-    agent = get_default_agent(
-        llm=llm,
-        cli_mode=True,
-        finish_tool_response_schema=TaskOutcome,
+    if len(repo_dirs) != 1:
+        raise RuntimeError("OpenCode ACP automation requires exactly one cloned repository")
+
+    print("\n=== OPENCODE ACP ===")
+    model = model_profile or "github-copilot/gpt-5.6-luna"
+    settings = ACPAgentSettings(
+        acp_server="opencode",
+        acp_command=["npx", "-y", "opencode-ai@1.18.31", "acp"],
+        acp_model=model,
+        acp_session_mode="build",
+        mcp_config=mcp_config,
+        agent_context=agent_context,
     )
-
-    # Add MCP config and agent_context using model_copy if configured
-    agent_updates = {}
-    if mcp_config:
-        agent_updates["mcp_config"] = mcp_config
-    if agent_context:
-        agent_updates["agent_context"] = agent_context
-    if agent_updates:
-        agent = agent.model_copy(update=agent_updates)
-
-    print(f"  tools: {[t.name for t in agent.tools]}")
-    print(f"  mcp_config: {'configured' if mcp_config else 'none'}")
-    print(f"  skills: {len(loaded_skills) if loaded_skills else 0}")
-    condenser_name = type(agent.condenser).__name__ if agent.condenser else "none"
-    print(f"  condenser: {condenser_name}")
-
-    # Create conversation
-    print("\n=== CONVERSATION ===")
-    received_events: list = []
-    last_event_time = {"ts": time.time()}
-
-    def event_callback(event) -> None:
-        received_events.append(event)
-        last_event_time["ts"] = time.time()
-        # Surface the LLM-authored ~10-word action summary as a live phase.
-        # Name-based check keeps this resilient across SDK versions.
-        if type(event).__name__ == "ActionEvent":
-            summary = getattr(event, "summary", None)
-            if isinstance(summary, str) and summary.strip():
-                redacted = _redact_phase(" ".join(summary.split()))
-                if redacted:
-                    _live_phase["pending"] = redacted[:200]
-
-    # Cloud workspaces supply richer automation tags (for example, whether the
-    # trigger was cron or webhook). Only add fallback tags in local mode.
-    default_tags = workspace.default_conversation_tags or {}
-    conversation_tags: dict[str, str] = {}
-    if not any(
-        default_tags.get(key)
-        for key in ("automationtrigger", "automationid", "automationrunid")
-    ):
-        conversation_tags["automationtrigger"] = "automation"
-
-    automation_run_id = os.environ.get("AUTOMATION_RUN_ID")
-    if automation_run_id and not default_tags.get("automationrunid"):
-        conversation_tags["automationrunid"] = automation_run_id
-
+    agent = settings.create_agent()
     conversation_kwargs = {
         "agent": agent,
         "workspace": workspace,
-        "callbacks": [event_callback],
+        "secrets": secrets,
         "hook_config": finish_tool_required_hook_config(SCRIPT_DIR),
-        "delete_on_close": False,  # Keep conversation history after completion
-        "tags": conversation_tags or None,
+        "delete_on_close": False,
     }
-    if automation_user_id and _conversation_supports_user_id():
-        conversation_kwargs["user_id"] = automation_user_id
-    # A `continue_conversation` run must use the derived id: RemoteConversation
-    # attaches to that conversation if it exists, and creates it if it does not.
     automation_conversation_id = os.environ.get("AUTOMATION_CONVERSATION_ID")
     if automation_conversation_id:
+
         conversation_kwargs["conversation_id"] = uuid.UUID(automation_conversation_id)
     conversation = Conversation(**conversation_kwargs)
     assert isinstance(conversation, RemoteConversation)
-    print(f"  conversation created: {type(conversation).__name__}")
-
-    # Set a descriptive title so automation runs are distinguishable in the
-    # conversation panel — otherwise the agent-server's autotitle falls back
-    # to a truncated prompt prefix. Failure is non-fatal; the run continues.
-    conversation_title = _build_conversation_title(event_context)
-    if conversation_title:
-        try:
-            resp = workspace.client.patch(
-                f"/api/conversations/{conversation.id}",
-                json={"title": conversation_title},
-            )
-            resp.raise_for_status()
-            print(f"  title: {conversation_title}")
-        except Exception as e:
-            # Not a hard failure — autotitle fallback still applies
-            print(f"  set title failed (non-fatal): {e}")
-
-    # Inject secrets into the conversation (auto-exported as env vars in bash)
-    if secrets:
-        conversation.update_secrets(secrets)
-        print(f"  injected {len(secrets)} secrets into conversation")
-
-    # Build session URL from conversation ID and inject as a secret so
-    # the agent can use $AUTOMATION_SESSION_URL in bash commands.
-    if not IS_LOCAL_MODE and api_url:
-        session_url = f"{api_url}/conversations/{conversation.id}"
-        conversation.update_secrets({"AUTOMATION_SESSION_URL": session_url})
-        print(f"  session URL: {session_url}")
+    print(f"  model: {model}")
+    print(f"  conversation created: {conversation.id}")
 
     report_phase("Agent is working on the task")
     threading.Thread(target=_phase_poster, name="phase-poster", daemon=True).start()
 
-    cost = None
     try:
         print(f"  sending prompt: {USER_PROMPT[:80]}...")
         conversation.send_message(USER_PROMPT)
         conversation.run()
-
-        # Post-run bookkeeping is best-effort: the conversation has already
-        # succeeded, and nothing below may raise out of the workspace context
-        # or the __exit__ callback would report FAILED for a successful run.
-        # The callback's cost comes from conversation.close() (cached stats),
-        # not from this live fetch.
-        try:
-            # Wait for the stream to settle
-            while time.time() - last_event_time["ts"] < 2.0:
-                time.sleep(0.1)
-
-            cost = (
-                conversation.conversation_stats.get_combined_metrics().accumulated_cost
-            )
-        except Exception as e:
-            print(f"  WARNING: post-run stats fetch failed (non-fatal): {e}")
-        print(f"  cost: {cost}")
-        print(f"  events received: {len(received_events)}")
     finally:
         _live_phase["stop"] = True
-        try:
-            conversation.close()
-        except Exception as e:
-            print(f"  WARNING: conversation.close() failed (non-fatal): {e}")
+        conversation.close()
 
     print("  conversation completed successfully")
 
