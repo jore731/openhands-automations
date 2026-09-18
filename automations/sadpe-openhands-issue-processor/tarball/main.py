@@ -319,6 +319,13 @@ with workspace_ctx as workspace:
             repos_config = json.load(f)
         if repos_config:
             report_phase("Cloning repositories")
+            # The deployment stores the GitHub credential under the explicit
+            # secret name; the SDK's clone helper looks for `github_token`.
+            github_token = workspace._get_secret_value("GITHUB_PERSONAL_ACCESS_TOKEN")
+            original_secret_fetcher = workspace._get_secret_value
+            workspace._get_secret_value = lambda name: (
+                github_token if name == "github_token" else original_secret_fetcher(name)
+            )
             clone_result = workspace.clone_repos(repos_config)
             print(f"  cloned {clone_result.success_count}/{len(repos_config)} repos")
             if clone_result.failed_repos:
@@ -408,7 +415,25 @@ More activity arrived on the same subject while this run was queued:
     model = model_profile or "github-copilot/gpt-5.6-luna"
     settings = ACPAgentSettings(
         acp_server="opencode",
-        acp_command=["npx", "-y", "opencode-ai@1.18.31", "acp"],
+        acp_command=[
+            "sh",
+            "-lc",
+            "set -eu; "
+            "export HOME=/home/openhands "
+            "XDG_CONFIG_HOME=/home/.config "
+            "XDG_DATA_HOME=/home/openhands/.local/share "
+            "XDG_STATE_HOME=/tmp/opencode-state "
+            "XDG_CACHE_HOME=/tmp/opencode-cache "
+            "OPENCODE_CONFIG_DIR=/home/.config/opencode; "
+            "bin=/tmp/opencode-bin-1.18.31; "
+            "if [ ! -x \"$bin\" ]; then "
+            "  dir=$(mktemp -d); cd \"$dir\"; "
+            "  package=$(npm pack --silent opencode-linux-arm64@1.18.31); "
+            "  tar -xzf \"$package\"; "
+            "  cp package/bin/opencode \"$bin\"; chmod 755 \"$bin\"; "
+            "fi; "
+            "exec \"$bin\" acp",
+        ],
         acp_model=model,
         acp_session_mode="build",
         mcp_config=mcp_config,
